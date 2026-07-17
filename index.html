@@ -4,7 +4,7 @@
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Self-Managing Builder — CRM</title>
 <!--
-  CRM Module v2.66
+  CRM Module v2.68
   Provenance:
     v1   - split from BD_Module_v11_1.html on 2026-05-17 per BD audit and split
     v1.1 - 2026-05-17 - Partners stack moved to Marketing module.
@@ -132,6 +132,36 @@
            script v3.0 enforces the role-based architecture. 793
            functional checks still pass (walkthrough 175, deep 438,
            exhaustive 180).
+    v2.68 - 2026-07-08 - SAVE SITE VISIT PRESERVES INK. Field report:
+           write on the form, click Save Site Visit, ink is gone.
+           Root cause: the SV modal onSave handler rebuilt siteVisit
+           from form fields only, then wrote it back over the lead -
+           wiping every autosaved side-artifact (inkPages, sketch,
+           scope, scan) that lives OUTSIDE the form fields. Fix:
+           snapshot those artifacts from the pre-save siteVisit and
+           carry each one forward on the fresh object; force a
+           persistLeads() at the end so the merged state is written
+           immediately. Autosave path (per-stroke debounced write)
+           is unchanged - this only closes the overwrite hole at
+           the explicit Save button.
+    v2.67 - 2026-07-08 - PENCIL WRITES CLEANLY (SCROLL FIX + PALM
+           REJECTION). Field report: spotty writing and the page
+           scrolling with the stroke. Root cause: touch-action pan-y
+           on the ink canvas told iOS Safari to treat touch contact
+           as scroll gestures, which interrupted Pencil strokes and
+           double-dispatched the motion as a scroll. Fixes: (1)
+           touch-action is now none on every ink canvas - Pencil is
+           the only input; touch contact on canvas is discarded so a
+           resting palm cannot scroll or draw; scrolling between
+           pages uses two fingers on the form or one finger outside
+           the ink area (the modal edge / scrollbar). (2) Pointer
+           capture on down so mid-stroke drop-outs cannot happen;
+           coalesced events on move for smoother lines; pointerleave
+           added to the finish handlers; touchmove preventDefault as
+           belt-and-suspenders against Safari's page-pan gesture.
+           (3) Finger draws too toggle no longer changes touch-
+           action; it only controls whether a bare finger touch is
+           accepted as ink. Copy updated to reflect the new model.
     v2.66 - 2026-07-08 - WRITE ON THE FORM, OWN SECTION FULL WIDTH.
            Field report: v2.65's grid-column:1/-1 escape from inside
            Company Template's grid did not visually free the writing
@@ -7702,7 +7732,7 @@ function openSiteVisitModal(id){
         '<div id="sv-upload-status" style="margin-top:8px;color:var(--txm)"></div>'+
         '<div style="margin-top:6px;color:var(--txd);font-size:var(--fz-base);line-height:1.5">If the form was filled by pen on paper or on a tablet PDF, attach the file here for the record. Attaching does not fill the tabs; AI reading of scanned handwriting arrives with the vision-capable proxy. Held in this session until document storage is enabled.</div>'+
       '</div>'
-    )+'<div class="smb-form-section" style="grid-column:1/-1">'+'<div class="smb-form-section-title">Write on the Form</div>'+'<div style="display:block">'+'<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;flex-wrap:wrap">'+'<span style="color:var(--txm);font-size:var(--fz-xs)">The whole form, one scroll. Pencil writes, finger scrolls. Handwriting saves itself and prints on these pages in the generated PDF.</span>'+'<label style="display:flex;align-items:center;gap:5px;font-size:var(--fz-xs);color:var(--txm);cursor:pointer;white-space:nowrap"><input type="checkbox" id="sv-finger-draw" onchange="svInkFingerMode(this.checked)">Finger draws too</label>'+'</div>'+'<div id="sv-ink-stack"></div>'+'</div>'+'</div>'+
+    )+'<div class="smb-form-section" style="grid-column:1/-1">'+'<div class="smb-form-section-title">Write on the Form</div>'+'<div style="display:block">'+'<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;flex-wrap:wrap">'+'<span style="color:var(--txm);font-size:var(--fz-xs)">Pencil writes. To scroll between pages, use two fingers on the form or one finger on the modal edge. Handwriting saves itself and prints on these pages in the generated PDF.</span>'+'<label style="display:flex;align-items:center;gap:5px;font-size:var(--fz-xs);color:var(--txm);cursor:pointer;white-space:nowrap"><input type="checkbox" id="sv-finger-draw" onchange="svInkFingerMode(this.checked)">Finger draws too</label>'+'</div>'+'<div id="sv-ink-stack"></div>'+'</div>'+'</div>'+
     _section('Visit',
       _fld('Visit date','date','date',sv.date||_today(),{required:true})+
       _fld('Attendees','attendees','text',sv.attendees||'',{full:true,placeholder:'Who walked the site'})
@@ -7772,6 +7802,17 @@ function openSiteVisitModal(id){
       l.siteVisit=r.data;
       l.siteVisit.uploadedForm=_svUpload;
       if(existing.generatedAt) l.siteVisit.generatedAt=existing.generatedAt;
+      // v2.68: preserve every artifact that is NOT captured by the form
+      // fields on save. The onSave handler used to overwrite siteVisit
+      // with only the form values, wiping inkPages, sketch, scope, and
+      // scan attachment even though autosave had stored them. Carry
+      // them across explicitly.
+      if(existing.inkPages) l.siteVisit.inkPages=existing.inkPages;
+      if(existing.sketch) l.siteVisit.sketch=existing.sketch;
+      if(existing.scope) l.siteVisit.scope=existing.scope;
+      if(existing.scan) l.siteVisit.scan=existing.scan;
+      if(existing.scanName) l.siteVisit.scanName=existing.scanName;
+      try{if(typeof persistLeads==='function')persistLeads();}catch(e){}
       closeModal();
       openLead(l.id);
       if(typeof toastInfo==='function')toastInfo('Site visit saved','Site visit and discovery recorded for '+(l.fn||'')+' '+(l.ln||'')+'.');
@@ -10327,9 +10368,11 @@ function _svSentences(tx){
 var _SV_INK={leadId:null,fingerDraw:false,saveTimers:{}};
 function svInkPageCount(){return (window.SMB_SV_PAGES||[]).length||0;}
 function svInkFingerMode(on){
+  // v2.67: touch-action stays 'none' regardless - Pencil writes, palm and
+  // finger contact on the canvas are simply ignored (never scroll). The
+  // finger-draw toggle now only controls whether a finger DRAWS: off by
+  // default so the palm resting on the iPad while writing does nothing.
   _SV_INK.fingerDraw=!!on;
-  var cs=document.querySelectorAll('.sv-ink-c');
-  for(var i=0;i<cs.length;i++)cs[i].style.touchAction=on?'none':'pan-y';
 }
 function svInkAutoSave(leadId,pg){
   if(_SV_INK.saveTimers[pg])clearTimeout(_SV_INK.saveTimers[pg]);
@@ -10371,7 +10414,7 @@ function svInkStack(leadId){
     var cv=document.createElement('canvas');
     cv.className='sv-ink-c';cv.setAttribute('data-pg',pg);
     cv.width=W;cv.height=H;
-    cv.style.cssText='position:absolute;left:0;top:0;width:100%;height:100%;touch-action:'+(_SV_INK.fingerDraw?'none':'pan-y');
+    cv.style.cssText='position:absolute;left:0;top:0;width:100%;height:100%;touch-action:none';
     wrap.appendChild(cv);
     var clr=document.createElement('button');
     clr.type='button';clr.className='btn btn-sm';
@@ -10390,21 +10433,39 @@ function svInkStack(leadId){
     ctx.lineWidth=3;ctx.lineCap='round';ctx.lineJoin='round';ctx.strokeStyle='#1a2a6b';
     var drawing=false;
     function pos(e){var r=cv.getBoundingClientRect();return {x:(e.clientX-r.left)*(W/r.width),y:(e.clientY-r.top)*(H/r.height)};}
+    // v2.67: robust Pencil-writes-here handling.
+    // - Pen pointer down: capture the pointer so the browser cannot steal
+    //   it mid-stroke (this is what caused the spotty writing).
+    // - Touch pointer: ignored on canvas (never draws, never scrolls -
+    //   scroll with a second finger or off-canvas).
+    // - Finger draw toggle: when explicitly ON, a touch pointer draws;
+    //   otherwise a touch on the canvas is discarded (palm rejection).
     cv.onpointerdown=function(e){
-      if(e.pointerType==='touch'&&!_SV_INK.fingerDraw)return; // finger scrolls
-      e.preventDefault();drawing=true;var p=pos(e);ctx.beginPath();ctx.moveTo(p.x,p.y);
+      if(e.pointerType==='touch'&&!_SV_INK.fingerDraw)return;
+      e.preventDefault();
+      drawing=true;
+      var p=pos(e);ctx.beginPath();ctx.moveTo(p.x,p.y);
       try{cv.setPointerCapture(e.pointerId);}catch(err){}
     };
     cv.onpointermove=function(e){
       if(!drawing)return;
       if(e.pointerType==='touch'&&!_SV_INK.fingerDraw)return;
-      e.preventDefault();var p=pos(e);ctx.lineTo(p.x,p.y);ctx.stroke();
+      e.preventDefault();
+      // Some browsers batch move events; getCoalescedEvents gives smoother
+      // lines when available.
+      var evs=(typeof e.getCoalescedEvents==='function')?e.getCoalescedEvents():[e];
+      for(var i=0;i<evs.length;i++){var p=pos(evs[i]);ctx.lineTo(p.x,p.y);}
+      ctx.stroke();
     };
-    cv.onpointerup=cv.onpointercancel=function(e){
+    cv.onpointerup=cv.onpointercancel=cv.onpointerleave=function(e){
       if(!drawing)return;
       drawing=false;
+      try{cv.releasePointerCapture(e.pointerId);}catch(err){}
       svInkAutoSave(leadId,pg);
     };
+    // Belt-and-suspenders: prevent iOS Safari's page-panning gesture from
+    // ever activating on the canvas by blocking touchmove at the source.
+    cv.addEventListener('touchmove',function(e){e.preventDefault();},{passive:false});
   });
 }
 // Back-compat shims: earlier sketch/ink entry points route to the stack.
