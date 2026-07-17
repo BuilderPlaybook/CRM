@@ -4,7 +4,7 @@
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Self-Managing Builder — CRM</title>
 <!--
-  CRM Module v2.68
+  CRM Module v2.71
   Provenance:
     v1   - split from BD_Module_v11_1.html on 2026-05-17 per BD audit and split
     v1.1 - 2026-05-17 - Partners stack moved to Marketing module.
@@ -132,6 +132,48 @@
            script v3.0 enforces the role-based architecture. 793
            functional checks still pass (walkthrough 175, deep 438,
            exhaustive 180).
+    v2.71 - 2026-07-08 - DECISION WINDOW INTELLIGENCE (world-class
+           item 6). Per-lead classification derived from facts
+           already on the lead (planningStage, timeline, lot, fin,
+           lcd): Committed / Ready / Qualifying / Explorer / Long-
+           window / Stalled. Each state carries a rule-based
+           recommendation. Renders inline on the lead-detail page
+           as a colored micro-panel between the pipeline strip and
+           the fact columns. Also emits buyerWindow[] on window.
+           SMB_SIGNALS.salesCrm so the AI Coach (when the AI Proxy
+           Backend goes live) reads the same classification and
+           speaks with better wording. Guard rails: Stalled beats
+           every other state (30+ days silent); Long-window beats
+           Ready for 12+ month timelines. Rules work without the
+           AI Proxy.
+    v2.70 - 2026-07-08 - LOSS ANALYSIS REPORT (world-class item 5).
+           New Reports tab between Funnel and Sources slicing lost
+           deals three ways off data CRM already owns (lostReason,
+           lostNotes, src, projectType, ecv on status='Lost' leads).
+           Headline row: Lost Value, Won Value, Win Rate (by value).
+           Loss by Reason table with dollar leak and percent of
+           total loss per reason. Loss by Source table on the same
+           shape. Win Rate by Project Type table with green at 50+,
+           amber 30-49, red under 30. Two honest guard rails: small-
+           sample banner if fewer than 10 closed deals in scope
+           (percentages move around at that size), and a Loss
+           capture gap warning when lost leads are missing a reason
+           or notes (so the sales team knows the report is only as
+           good as what they logged).
+    v2.69 - 2026-07-08 - SV MODAL SCROLLS PROPERLY ON iPAD. Field
+           report: form pages are visible but the modal cannot
+           scroll, so the top of the form is unreachable. Root
+           cause: the shared modal card caps at 100vh - 64px and
+           its body scrolls internally; every ink canvas has
+           touch-action none for palm rejection, so touching any
+           canvas cannot scroll the modal - and the canvases fill
+           most of the modal. Fix: when the SV modal is open
+           (.smb-modal-card.sv-wide), the card drops its max-height
+           and its body drops its overflow, letting the whole page
+           scroll normally. Header and footer become position:
+           sticky so the title and Save button stay reachable at
+           the top and bottom while the form flows in between.
+           Pen palm-rejection unchanged. Other modals unaffected.
     v2.68 - 2026-07-08 - SAVE SITE VISIT PRESERVES INK. Field report:
            write on the form, click Save Site Visit, ink is gone.
            Root cause: the SV modal onSave handler rebuilt siteVisit
@@ -3755,7 +3797,7 @@ tr.clickable:hover .quick-actions{display:flex}
 /* ═══ BD CRUD MODAL CSS (BD v10) ═══ */
 .smb-modal-bd{position:fixed;inset:0;background:var(--overlay-dark-55);z-index:9999;display:none;align-items:flex-start;justify-content:center;overflow-y:auto;padding:32px 16px}
 .smb-modal-bd.open{display:flex}
-.smb-modal-card{background:#fff;border-radius:10px;box-shadow:0 25px 50px -12px rgba(0,0,0,.35);width:100%;max-width:820px;display:flex;flex-direction:column;max-height:calc(100vh - 64px)} .smb-modal-card.sv-wide{max-width:min(1400px,calc(100vw - 32px))}
+.smb-modal-card{background:#fff;border-radius:10px;box-shadow:0 25px 50px -12px rgba(0,0,0,.35);width:100%;max-width:820px;display:flex;flex-direction:column;max-height:calc(100vh - 64px)} .smb-modal-card.sv-wide{max-width:min(1400px,calc(100vw - 32px));max-height:none} .smb-modal-card.sv-wide .smb-modal-body{overflow:visible;max-height:none} .smb-modal-card.sv-wide .smb-modal-hd{position:sticky;top:0;z-index:2} .smb-modal-card.sv-wide .smb-modal-ft{position:sticky;bottom:0;z-index:2}
 .smb-modal-hd{padding:14px 20px;border-bottom:1px solid var(--brd);display:flex;align-items:center;justify-content:space-between;flex-shrink:0;background:#fff;border-radius:10px 10px 0 0}
 .smb-modal-title{font-size:var(--fz-lg);font-weight:700;color:var(--txt);line-height:1.3}
 .smb-modal-sub{font-size:var(--fz-body);color:var(--txm);margin-top:2px}
@@ -7889,6 +7931,7 @@ function openLead(id){
   '<div id="crm-coach-mount"></div>'+
   '<div class="lead-pipe">'+stageTrack+'</div>'+
   nextActionStrip(l)+
+  _renderDecisionWindow(l)+
   '<div class="rec-layout">'+
     '<div>'+
       // Contact Information
@@ -10868,7 +10911,8 @@ function buildSalesCrmSignals(){
       stageConversion:stageConversion,
       stuckInStage:stuckInStage
     },
-    attention:attention
+    attention:attention,
+    buyerWindow:(function(){try{return (window.LEADS||[]).filter(function(l){return l&&l.status==='Opportunity';}).map(function(l){var d=(window.classifyDecisionWindow?window.classifyDecisionWindow(l):null);return d?{leadId:l.id,name:(l.fn||'')+' '+(l.ln||''),state:d.state,label:d.label,recommend:d.recommend}:null;}).filter(function(x){return x;});}catch(e){return [];}})()
   };
 }
 
@@ -11358,6 +11402,61 @@ function kbChip(l){
   return ' '+naChip(d);
 }
 // Lead-detail strip: the single next thing to do, above the data sheet.
+// v2.71 (world-class #6): Decision-Window classifier + recommender.
+window.classifyDecisionWindow=function(l){
+  if(!l||l.status==='Complete'||l.status==='Lost')return null;
+  var lot=(l.lot||''),fin=(l.fin||''),ps=(l.planningStage||''),tl=(l.timeline||'');
+  var days=(typeof daysSince==='function'&&l.lcd)?daysSince(l.lcd):null;
+  var lotSecured=/Secured|Own|Have/i.test(lot);
+  var finConfirmed=/Confirmed|Yes/i.test(fin);
+  var readyPlan=/Ready to begin|Ready to start/i.test(ps);
+  var exploring=/exploring|Just/i.test(ps);
+  var longTimeline=/12\+|12\-18|18\+|Not sure/i.test(tl);
+  if(days!=null&&days>=30){
+    return {state:'Stalled',color:'red',
+      label:'Stalled - '+days+' days silent',
+      recommend:'Personal check-in from the assigned PM, not a template. Reference their project by name and ask one specific question about progress (financing, plans, timing).'};
+  }
+  if(lotSecured&&finConfirmed&&readyPlan){
+    return {state:'Committed',color:'grn',
+      label:'Committed - lot, financing, ready to plan',
+      recommend:'Push for the Conceptual Estimate this week. Send an agenda, book a working session for scope, and put the CE on the calendar with a deadline.'};
+  }
+  if(longTimeline){
+    return {state:'Long-window',color:'blu',
+      label:'Long-window - 12+ month timeline',
+      recommend:'Quarterly touchpoints only. Send one high-value piece per quarter (case study, cost planning guide, market update). Do not push for meetings until they signal a shorter window.'};
+  }
+  if(readyPlan&&(lotSecured||finConfirmed)){
+    return {state:'Ready',color:'grn',
+      label:'Ready - planning is on, '+(lotSecured?'lot secured':'financing confirmed'),
+      recommend:'Schedule the Site Visit this week. Confirm the missing piece ('+(lotSecured?'financing':'lot')+') on the same call.'};
+  }
+  if(exploring||(!readyPlan&&!lotSecured&&!finConfirmed)){
+    return {state:'Explorer',color:'gry',
+      label:'Explorer - still shopping',
+      recommend:'Send the Cost Planning Guide and one relevant case study. Do not push for a meeting; ask what would help them decide.'};
+  }
+  var gaps=[lotSecured?'':'lot',finConfirmed?'':'financing',readyPlan?'':'planning stage'].filter(function(x){return x;}).join(', ');
+  return {state:'Qualifying',color:'amb',
+    label:'Qualifying - partial signals',
+    recommend:'One qualification call this week to fill the gaps: '+gaps+' - then reclassify.'};
+};
+function _renderDecisionWindow(l){
+  var d=(window.classifyDecisionWindow?window.classifyDecisionWindow(l):null);
+  if(!d)return '';
+  var bord={grn:'var(--grn)',red:'var(--red)',amb:'var(--amb)',blu:'var(--blu)',gry:'var(--gry)'}[d.color]||'var(--gry)';
+  var bg={grn:'var(--grnb)',red:'var(--redb)',amb:'var(--ambb)',blu:'var(--blub)',gry:'var(--gryb)'}[d.color]||'var(--gryb)';
+  return '<div style="margin:12px 0;padding:12px 14px;border-left:3px solid '+bord+';background:'+bg+';border-radius:6px">'+
+    '<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">'+
+      '<div><div style="font-size:var(--fz-xs);text-transform:uppercase;letter-spacing:.4px;color:var(--txm);font-weight:700">Decision Window</div>'+
+      '<div style="font-weight:700;color:var(--txt);margin-top:2px">'+_esc(d.label)+'</div></div>'+
+      '<span class="chip c-'+d.color+'">'+_esc(d.state)+'</span>'+
+    '</div>'+
+    '<div style="margin-top:6px;color:var(--txt);font-size:var(--fz-body)">'+_esc(d.recommend)+'</div>'+
+  '</div>';
+}
+
 function nextActionStrip(l){
   if(l.status==='On Hold'){
     var due=l.holdUntil?daysUntil(l.holdUntil):null;
@@ -12132,6 +12231,7 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
   var RPT_TABS=[
     {id:'overview',label:'Overview',hint:'The ten-second read: targets, forecast, response speed, pipeline snapshot'},
     {id:'funnel',label:'Funnel',hint:'Where deals move and where they die: conversion, win rate, losses'},
+    {id:'losses',label:'Loss Analysis',hint:'Where you actually lose deals: reason, source, and project type breakdowns with dollar leak'},
     {id:'sources',label:'Sources',hint:'What feeds the pipeline: lead sources and project types'},
     {id:'team',label:'Team',hint:'Who is performing: per-rep results, overdue load, velocity'},
     {id:'lifecycle',label:'Lifecycle',hint:'Throughput: when pre-cons, contracts, starts, and completions happened'}
@@ -12605,6 +12705,82 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
     html+=renderLifecycleMatrix(fn, STATE.projectType||'All', '_lc_all');
     html+='</div>';
 
+    }
+    // v2.70 (#5 Loss Analysis): dedicated tab slicing lost deals by why,
+    // by source, and win rate by project type. Data source already exists
+    // per lead (status='Lost', lostReason, lostNotes, src, projectType,
+    // ecv); the missing piece was reporting the leak at portfolio level.
+    if(TAB==='losses'){
+      var _lost=leads.filter(function(l){return l.status==='Lost';});
+      var _won =leads.filter(function(l){return l.status==='Complete';});
+      var _considered=_lost.concat(_won); // for win rate
+      var _lostVal=_lost.reduce(function(a,l){return a+(l.ecv||0);},0);
+      var _wonVal =_won.reduce(function(a,l){return a+(l.ecv||0);},0);
+      var _pot=_lostVal+_wonVal;
+      var _rate=_pot?Math.round(_wonVal/_pot*100):0;
+      // Headline: dollar leak in scope
+      html+='<div class="card" style="padding:0;margin-bottom:16px"><div class="card-hd" style="padding:14px 16px"><span class="card-title">Loss Analysis<button class="info-icon" type="button" aria-label="About this card" tabindex="0"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="6.5"/><line x1="8" y1="7.5" x2="8" y2="11.5"/><line x1="8" y1="5" x2="8" y2="5.01"/></svg><span class="tip">Where deals died in the current scope. The three views answer three different questions: WHY you lose (Reason), WHERE the losing leads came from (Source), and WHICH project types you convert best (Project Type). Small sample sizes mean the percentages move around; report gets stable at ~20 closed leads.</span></button></span></div>'+
+        '<div class="card-body" style="display:flex;gap:18px;flex-wrap:wrap">'+
+          '<div style="flex:1;min-width:140px"><div style="font-size:var(--fz-xs);text-transform:uppercase;letter-spacing:.4px;color:var(--txm);font-weight:700">Lost Value</div><div style="font-size:28px;font-weight:700;color:var(--red)">'+fmtM(_lostVal)+'</div><div style="font-size:var(--fz-xs);color:var(--txm)">'+_lost.length+' lost deal'+(_lost.length===1?'':'s')+'</div></div>'+
+          '<div style="flex:1;min-width:140px"><div style="font-size:var(--fz-xs);text-transform:uppercase;letter-spacing:.4px;color:var(--txm);font-weight:700">Won Value</div><div style="font-size:28px;font-weight:700;color:var(--grn)">'+fmtM(_wonVal)+'</div><div style="font-size:var(--fz-xs);color:var(--txm)">'+_won.length+' won</div></div>'+
+          '<div style="flex:1;min-width:140px"><div style="font-size:var(--fz-xs);text-transform:uppercase;letter-spacing:.4px;color:var(--txm);font-weight:700">Win Rate</div><div style="font-size:28px;font-weight:700">'+_rate+'%</div><div style="font-size:var(--fz-xs);color:var(--txm)">by value, closed deals</div></div>'+
+        '</div></div>';
+      // Reasonable warning on small samples
+      if(_considered.length<10){
+        html+='<div style="margin-bottom:12px;padding:10px 14px;background:var(--ambb);border-left:3px solid var(--amb);border-radius:6px;color:var(--txt);font-size:var(--fz-body)">Small sample: '+_considered.length+' closed deal'+(_considered.length===1?'':'s')+' in scope. Percentages move around at this size; report gets stable at about 20 closed leads.</div>';
+      }
+      // Slice helper
+      function _sliceLosses(key,label){
+        var groups={};
+        _lost.forEach(function(l){
+          var k=(l[key]||'(none)').toString().trim()||'(none)';
+          (groups[k]=groups[k]||{k:k,count:0,value:0}).count++;
+          groups[k].value+=(l.ecv||0);
+        });
+        var rows=Object.keys(groups).map(function(k){return groups[k];}).sort(function(a,b){return b.value-a.value||b.count-a.count;});
+        if(!rows.length)return '<div class="card" style="padding:0;margin-bottom:16px"><div class="card-hd" style="padding:14px 16px"><span class="card-title">'+label+'</span></div><div class="card-body" style="color:var(--txm)">No lost deals in scope.</div></div>';
+        var total=rows.reduce(function(a,r){return a+r.value;},0)||1;
+        var html2='<div class="card" style="padding:0;margin-bottom:16px"><div class="card-hd" style="padding:14px 16px"><span class="card-title">'+label+'</span></div><div class="card-body">'+
+          '<table style="width:100%;border-collapse:collapse"><thead><tr><th style="text-align:left">'+label.replace('Loss by ','')+'</th><th style="text-align:right">Lost</th><th style="text-align:right">Value</th><th style="text-align:right">% of leak</th></tr></thead><tbody>';
+        rows.forEach(function(r){
+          var pct=Math.round(r.value/total*100);
+          html2+='<tr><td>'+esc(r.k)+'</td><td style="text-align:right">'+r.count+'</td><td style="text-align:right;font-weight:700">'+(r.value?fmtM(r.value):' - ')+'</td><td style="text-align:right"><span style="display:inline-block;min-width:36px;text-align:right">'+pct+'%</span></td></tr>';
+        });
+        html2+='</tbody></table></div></div>';
+        return html2;
+      }
+      html+=_sliceLosses('lostReason','Loss by Reason');
+      html+=_sliceLosses('src','Loss by Source');
+      // Win rate by project type
+      var byType={};
+      _considered.forEach(function(l){
+        var k=(l.projectType||'(none)').toString().trim()||'(none)';
+        var g=byType[k]=byType[k]||{k:k,won:0,lost:0,wonV:0,lostV:0};
+        if(l.status==='Complete'){g.won++;g.wonV+=(l.ecv||0);}
+        else{g.lost++;g.lostV+=(l.ecv||0);}
+      });
+      var typeRows=Object.keys(byType).map(function(k){var g=byType[k];g.n=g.won+g.lost;g.rate=g.n?Math.round(g.wonV/((g.wonV+g.lostV)||1)*100):0;return g;}).sort(function(a,b){return (b.wonV+b.lostV)-(a.wonV+a.lostV);});
+      html+='<div class="card" style="padding:0;margin-bottom:16px"><div class="card-hd" style="padding:14px 16px"><span class="card-title">Win Rate by Project Type</span></div><div class="card-body">';
+      if(!typeRows.length){
+        html+='<div style="color:var(--txm)">No closed deals in scope.</div>';
+      }else{
+        html+='<table style="width:100%;border-collapse:collapse"><thead><tr><th style="text-align:left">Project Type</th><th style="text-align:right">Won</th><th style="text-align:right">Lost</th><th style="text-align:right">Won Value</th><th style="text-align:right">Win Rate</th></tr></thead><tbody>';
+        typeRows.forEach(function(r){
+          var col=r.rate>=50?'var(--grn)':(r.rate>=30?'var(--amb)':'var(--red)');
+          html+='<tr><td>'+esc(r.k)+'</td><td style="text-align:right">'+r.won+'</td><td style="text-align:right">'+r.lost+'</td><td style="text-align:right;font-weight:700">'+(r.wonV?fmtM(r.wonV):' - ')+'</td><td style="text-align:right;color:'+col+';font-weight:700">'+r.rate+'%</td></tr>';
+        });
+        html+='</tbody></table></div></div>';
+      }
+      // Notes leak: lost deals with no notes / no reason
+      var _noReason=_lost.filter(function(l){return !(l.lostReason||'').trim();}).length;
+      var _noNotes=_lost.filter(function(l){return !(l.lostNotes||'').trim();}).length;
+      if(_lost.length&&(_noReason||_noNotes)){
+        html+='<div style="margin-bottom:12px;padding:10px 14px;background:var(--ambb);border-left:3px solid var(--amb);border-radius:6px;color:var(--txt);font-size:var(--fz-body)">Loss capture gap: '+
+          (_noReason?_noReason+' lost lead'+(_noReason===1?'':'s')+' missing a reason':'')+
+          (_noReason&&_noNotes?'; ':'')+
+          (_noNotes?_noNotes+' missing lost notes':'')+
+          '. Fill these on the lead detail so the analysis has something to slice.</div>';
+      }
     }
     // v2.61 (#8): Top Referrers. Referral attribution already existed at
     // the category level (source values, per-lead Referral Name, score
