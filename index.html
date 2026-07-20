@@ -1296,6 +1296,22 @@
            Strategic Plan step unchanged (VTO Review checklist + full embedded
            editable plan both remain). No change to canon, chrome, catalog,
            components, engine, contracts, or VSP_STORAGE_VERSION.
+    v102 - 2026-07-20 - The Avg column tells the truth to two decimals. The
+           per-section view rounded the average to one decimal AS A STRING
+           and then judged the cell color on the rounded value, so an
+           8.0227 average could display as a green-looking 8 while the row
+           bar judged the real number red. The raw average is now used for
+           all color judgment and the display carries two decimals when they
+           exist (clean integers stay clean), matching the bar label. Build
+           stamp bumped to v102.
+    v101 - 2026-07-20 - Failure always paints. In the projection gauge, a
+           metric that misses its goal with a computed fill of zero (a <=
+           metric running OVER its ceiling drives the distance-to-goal fill
+           negative) now draws a solid full-width bar in its tier color
+           instead of an invisible sliver on pale tint; partial fills under a
+           >= goal keep their meaning (progress toward goal, colored by
+           tier). Same rule the keep-at-zero gauge received in v92. Build
+           stamp bumped to v101.
     v100 - 2026-07-20 - Binary scoring by default (Dave's ruling, EOS
            convention): a measurable is GREEN when it meets its goal and RED
            when it does not. The implicit within-10%-of-goal amber band is
@@ -2598,7 +2614,7 @@ summary:focus-visible,
       </div>
     </div>
     <div class="tb-r">
-      <span title="Running build. If this does not match the latest ship, hard-refresh (Ctrl+Shift+R)." style="font-size:var(--fz-xs);color:var(--txd);border:1px solid var(--brd);border-radius:5px;padding:2px 6px;white-space:nowrap">v100</span> <span id="vsp-save-status" title="Your changes save automatically to this device" style="display:none;align-items:center;gap:5px;font-size:var(--fz-sm);color:var(--txm);margin-right:2px;white-space:nowrap"></span> <button class="help-btn" id="help-btn" onclick="openTourMenu(event)" title="Help & Tours" style="background:transparent;border:1px solid var(--brd);border-radius:6px;padding:5px 9px;cursor:pointer;color:var(--txm)"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" width="14" height="14"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></button> <button id="backup-btn" onclick="vspBackupData()" title="Back up all your data to a file" style="background:transparent;border:1px solid var(--brd);border-radius:6px;padding:5px 10px;cursor:pointer;color:var(--txm);display:inline-flex;align-items:center;gap:5px"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" width="14" height="14"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg><span style="font-size:var(--fz-sm)">Back up</span></button> <button id="restore-btn" onclick="vspRestoreData()" title="Restore data from a backup file" style="background:transparent;border:1px solid var(--brd);border-radius:6px;padding:5px 9px;cursor:pointer;color:var(--txm)"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" width="14" height="14"><path d="M3 12a9 9 0 109-9 9 9 0 00-6.36 2.64L3 8"/><path d="M3 3v5h5"/></svg></button> <div id="team-selector" style="position:relative"></div>
+      <span title="Running build. If this does not match the latest ship, hard-refresh (Ctrl+Shift+R)." style="font-size:var(--fz-xs);color:var(--txd);border:1px solid var(--brd);border-radius:5px;padding:2px 6px;white-space:nowrap">v102</span> <span id="vsp-save-status" title="Your changes save automatically to this device" style="display:none;align-items:center;gap:5px;font-size:var(--fz-sm);color:var(--txm);margin-right:2px;white-space:nowrap"></span> <button class="help-btn" id="help-btn" onclick="openTourMenu(event)" title="Help & Tours" style="background:transparent;border:1px solid var(--brd);border-radius:6px;padding:5px 9px;cursor:pointer;color:var(--txm)"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" width="14" height="14"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></button> <button id="backup-btn" onclick="vspBackupData()" title="Back up all your data to a file" style="background:transparent;border:1px solid var(--brd);border-radius:6px;padding:5px 10px;cursor:pointer;color:var(--txm);display:inline-flex;align-items:center;gap:5px"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" width="14" height="14"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg><span style="font-size:var(--fz-sm)">Back up</span></button> <button id="restore-btn" onclick="vspRestoreData()" title="Restore data from a backup file" style="background:transparent;border:1px solid var(--brd);border-radius:6px;padding:5px 9px;cursor:pointer;color:var(--txm)"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" width="14" height="14"><path d="M3 12a9 9 0 109-9 9 9 0 00-6.36 2.64L3 8"/><path d="M3 3v5h5"/></svg></button> <div id="team-selector" style="position:relative"></div>
       <span class="badge" id="qtr-badge">Q2 2026</span>
       <!-- Global Create Button (VSP-specific feature, kept) -->
       <div style="position:relative" id="create-btn-wrap">
@@ -5809,6 +5825,9 @@ function _renderProjectionGauge(m){
     var dev = effGoal !== 0 ? Math.abs(rv - effGoal) / Math.abs(effGoal) : 0;
     fillPct = Math.max(0, Math.min(100, (1-dev)*100));
   }
+  // v101: an off-goal row must be visibly painted. A <= metric over its
+  // ceiling computes a zero fill; draw it full-width in the tier color.
+  if(tier !== 'green' && fillPct <= 2) fillPct = 100;
   var tooltip = 'Bar fill = period average against goal. Color follows the red/amber/green rule from the edit tab.';
   var h = '<div title="'+tooltip+'" style="position:relative;height:8px;background:'+bgTint+';border-radius:4px;margin-top:6px;overflow:visible">';
   h += '<div style="position:absolute;left:0;top:0;bottom:0;width:'+fillPct.toFixed(1)+'%;background:'+tierVar+';border-radius:4px 0 0 4px"></div>';
@@ -9491,7 +9510,8 @@ function renderScorecard(){
         var cols=d.cols[mi];
         var allVals=m.readings.filter(function(v){return v!==null&&v!==undefined&&typeof v==='number';});
         var validCols=cols.filter(function(v){return v!==null&&v!==undefined&&typeof v==='number';});
-        var avg=(validCols.length?(validCols.reduce(function(a,b){return a+b;},0)/validCols.length).toFixed(1):' - ');
+        var rawAvg=validCols.length?(validCols.reduce(function(a,b){return a+b;},0)/validCols.length):null;
+        var avg=rawAvg==null?' - ':(Math.round(rawAvg*100)/100);
         var total=validCols.length?validCols.reduce(function(a,b){return a+b;},0):'';
         // Format total based on unit (uses fmtVal for $/% awareness)
         var totalDisplay=total===''?' - ':fmtVal(total,m.unit);
@@ -16477,7 +16497,7 @@ function renderTopbarV2(){
 // reload or browser restart on the same device keeps the meeting state.
 // Does NOT sync across devices. Cleared via vspClearLocalData() on console.
 var VSP_STORAGE_VERSION = 4;
-window.VSP_BUILD = 'v100';
+window.VSP_BUILD = 'v102';
 var SC_LAYOUT_TOKEN = "v3b44";
 
 // Date helper: today as YYYY-MM-DD (post-meeting feedback May 21 - dates standardized)
