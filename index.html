@@ -14313,6 +14313,31 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
     'smb.crm.ceBoilerplate.v2.commercial'
   ];
 
+  // RTDB forbids . $ # [ ] / in key names; KEYS predates that constraint and
+  // is also the fixed set of localStorage names, so it can't change. Translate
+  // only at the wire boundary - PUT/GET bodies use escaped key names, every
+  // other use of KEYS (localStorage, _sig, applyEnvelope) is untouched.
+  var WIRE_ESCAPES = { '.': '%2E', '$': '%24', '#': '%23', '[': '%5B', ']': '%5D', '/': '%2F' };
+  function wireKey(k){
+    return k.replace(/[.$#\[\]\/]/g, function(c){ return WIRE_ESCAPES[c]; });
+  }
+  function unwireKey(k){
+    return k.replace(/%2E|%24|%23|%5B|%5D|%2F/g, function(m){
+      for(var c in WIRE_ESCAPES){ if(WIRE_ESCAPES[c] === m) return c; }
+      return m;
+    });
+  }
+  function toWireEnvelope(env){
+    var out = { v: env.v, keys: {} };
+    for(var k in env.keys){ if(Object.prototype.hasOwnProperty.call(env.keys, k)) out.keys[wireKey(k)] = env.keys[k]; }
+    return out;
+  }
+  function fromWireEnvelope(env){
+    var out = { v: env.v, keys: {} };
+    for(var k in env.keys){ if(Object.prototype.hasOwnProperty.call(env.keys, k)) out.keys[unwireKey(k)] = env.keys[k]; }
+    return out;
+  }
+
   function collectLocal(){
     var m = {};
     for(var i=0;i<KEYS.length;i++){
@@ -14708,7 +14733,7 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
     rtdbFetch({
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(env)
+      body: JSON.stringify(toWireEnvelope(env))
     }).then(function(res){
       if(handleRtdbAuthFailure(res)) return;
       if(!res.ok){
@@ -14767,7 +14792,7 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
       if(!serverEmpty){
         try {
           var parsed = JSON.parse(txt);
-          if(parsed && typeof parsed === 'object' && parsed.keys && typeof parsed.keys === 'object') remote = parsed;
+          if(parsed && typeof parsed === 'object' && parsed.keys && typeof parsed.keys === 'object') remote = fromWireEnvelope(parsed);
           else unreadable = true;
         } catch(e){ unreadable = true; }
       }
