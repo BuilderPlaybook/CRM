@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en" data-default-roles="owner,coo,cfo,vp-construction,project-manager,sales-rep,estimator,marketing-coord">
 <head>
@@ -15384,7 +15383,10 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
    key -> raw string over a FIXED key list, with a content signature over
    the key set in fixed order.
    MODEL:
-     1. ON LOAD: pull the team's latest data from the cloud ONCE and show it.
+     1. ON LOAD: after Firebase Email/Password sign-in, pull the team's
+        latest data from the cloud ONCE and show it. No RTDB traffic
+        until sign-in succeeds. ID tokens are sent as ?auth= on REST
+        GET/PUT. Tokens refresh; Sign out stops pull/pushUp.
      2. AS YOU WORK: each save is sent up (debounced). No background polling.
      3. TO SEE TEAMMATES' CHANGES: tap the badge to refresh on demand.
    DEPLOY SAFETY (v2.1): this file can NEVER overwrite non-empty server data.
@@ -15403,6 +15405,13 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
   var ENDPOINT = FB_URL.replace(/\/+$/,'') + '/' + FB_PATH + '.json';
   var REST = 'Synced - tap to refresh';
   var ENVELOPE_V = 3;
+  // Public Firebase Web API key (Browser key). Not a password, private key, or
+  // service-account credential. Paste from Firebase Console: Project settings
+  // (gear) > General > Your apps > Web app > apiKey. Auth REST cannot run
+  // without it. Optional override: window.SMB_FB_WEB_API_KEY before this block.
+  var FB_WEB_API_KEY = (typeof window.SMB_FB_WEB_API_KEY === 'string' && window.SMB_FB_WEB_API_KEY) ? window.SMB_FB_WEB_API_KEY : 'AIzaSyCGJHZZlMdlZiwju927yOSFrH6DIOFI_Sg';
+  var AUTH_SS_KEY = 'smb.crm.stage.fbAuth';
+  var ID_TOKEN_SKEW_MS = 60000;
 
   // Fixed key list, fixed order. Adding a key later bumps ENVELOPE_V.
   // v2: + smb.crm.ceBoilerplate.v1 (single company standard, legacy).
@@ -15451,6 +15460,310 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
   var pulling = false;
   var lastInputTs = 0;
   var ready = false;         // no push before the load-time pull reconciles
+  var auth = { idToken: null, refreshToken: null, expiresAt: 0, email: null, localId: null };
+  var authBusy = false;
+
+  function isAuthed(){
+    return !!(auth && auth.idToken && auth.refreshToken);
+  }
+
+  function persistAuth(){
+    try {
+      if(!isAuthed()){ sessionStorage.removeItem(AUTH_SS_KEY); return; }
+      sessionStorage.setItem(AUTH_SS_KEY, JSON.stringify({
+        idToken: auth.idToken,
+        refreshToken: auth.refreshToken,
+        expiresAt: auth.expiresAt,
+        email: auth.email || '',
+        localId: auth.localId || ''
+      }));
+    } catch(e){}
+  }
+
+  function restoreAuth(){
+    try {
+      var raw = sessionStorage.getItem(AUTH_SS_KEY);
+      if(!raw) return false;
+      var o = JSON.parse(raw);
+      if(!o || !o.idToken || !o.refreshToken) return false;
+      auth.idToken = o.idToken;
+      auth.refreshToken = o.refreshToken;
+      auth.expiresAt = Number(o.expiresAt) || 0;
+      auth.email = o.email || null;
+      auth.localId = o.localId || null;
+      return true;
+    } catch(e){ return false; }
+  }
+
+  function clearAuth(){
+    auth.idToken = null;
+    auth.refreshToken = null;
+    auth.expiresAt = 0;
+    auth.email = null;
+    auth.localId = null;
+    try { sessionStorage.removeItem(AUTH_SS_KEY); } catch(e){}
+  }
+
+  function applyTokenPayload(idToken, refreshToken, expiresIn, email, localId){
+    var sec = parseInt(expiresIn, 10);
+    if(!(sec > 0)) sec = 3600;
+    auth.idToken = idToken;
+    if(refreshToken) auth.refreshToken = refreshToken;
+    auth.expiresAt = Date.now() + (sec * 1000);
+    if(email) auth.email = email;
+    if(localId) auth.localId = localId;
+    persistAuth();
+  }
+
+  function friendlyAuthError(code, fallback){
+    var c = String(code || '').toUpperCase();
+    if(c.indexOf('INVALID_LOGIN_CREDENTIALS') >= 0 || c.indexOf('INVALID_PASSWORD') >= 0 ||
+       c.indexOf('EMAIL_NOT_FOUND') >= 0 || c.indexOf('INVALID_EMAIL') >= 0 ||
+       c.indexOf('USER_NOT_FOUND') >= 0){
+      return 'Invalid email or password.';
+    }
+    if(c.indexOf('USER_DISABLED') >= 0) return 'This account is disabled.';
+    if(c.indexOf('TOO_MANY_ATTEMPTS') >= 0) return 'Too many attempts. Try again later.';
+    if(c.indexOf('API_KEY_INVALID') >= 0 || c.indexOf('API KEY NOT VALID') >= 0){
+      return 'Firebase is not configured in this copy of the CRM (missing or invalid Web API key).';
+    }
+    if(c.indexOf('TOKEN_EXPIRED') >= 0 || c.indexOf('INVALID_ID_TOKEN') >= 0 ||
+       c.indexOf('INVALID_REFRESH_TOKEN') >= 0 || c.indexOf('USER_TOKEN_EXPIRED') >= 0){
+      return 'Your session expired. Please sign in again.';
+    }
+    if(c.indexOf('NETWORK') >= 0) return 'Network failure. Check your connection and try again.';
+    return fallback || 'Sign-in failed. Please try again.';
+  }
+
+  function parseGoogleError(txt){
+    try {
+      var j = JSON.parse(txt);
+      if(j && j.error){
+        if(typeof j.error === 'string') return j.error;
+        if(j.error.message) return j.error.message;
+      }
+    } catch(e){}
+    return '';
+  }
+
+  function rtdbDenied(status, txt){
+    if(status === 403) return true;
+    try {
+      var j = JSON.parse(txt);
+      if(j && typeof j.error === 'string' && /permission denied/i.test(j.error)) return true;
+      if(j && j.error && typeof j.error.message === 'string' && /permission denied/i.test(j.error.message)) return true;
+    } catch(e){}
+    return false;
+  }
+
+  function rtdbUnauth(status, txt){
+    if(status === 401) return true;
+    try {
+      var j = JSON.parse(txt);
+      if(j && typeof j.error === 'string' && /unauthorized/i.test(j.error)) return true;
+    } catch(e){}
+    return false;
+  }
+
+  function signInWithPassword(email, password){
+    if(!FB_WEB_API_KEY){
+      return Promise.reject(new Error('Firebase is not configured in this copy of the CRM (missing Web API key).'));
+    }
+    var url = 'https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=' + encodeURIComponent(FB_WEB_API_KEY);
+    return fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: email, password: password, returnSecureToken: true })
+    }).then(function(r){
+      return r.text().then(function(txt){
+        if(!r.ok){
+          throw new Error(friendlyAuthError(parseGoogleError(txt), 'Sign-in failed. Please try again.'));
+        }
+        var j;
+        try { j = JSON.parse(txt); } catch(e){ throw new Error('Sign-in failed. Please try again.'); }
+        if(!j || !j.idToken || !j.refreshToken){
+          throw new Error('Sign-in failed. Please try again.');
+        }
+        applyTokenPayload(j.idToken, j.refreshToken, j.expiresIn, j.email || email, j.localId);
+      });
+    });
+  }
+
+  function refreshIdToken(){
+    if(!FB_WEB_API_KEY) return Promise.reject(new Error('missing-api-key'));
+    if(!auth.refreshToken) return Promise.reject(new Error('no-refresh-token'));
+    var url = 'https://securetoken.googleapis.com/v1/token?key=' + encodeURIComponent(FB_WEB_API_KEY);
+    var body = 'grant_type=refresh_token&refresh_token=' + encodeURIComponent(auth.refreshToken);
+    return fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body
+    }).then(function(r){
+      return r.text().then(function(txt){
+        if(!r.ok){
+          throw new Error(friendlyAuthError(parseGoogleError(txt), 'Your session expired. Please sign in again.'));
+        }
+        var j;
+        try { j = JSON.parse(txt); } catch(e){ throw new Error('Your session expired. Please sign in again.'); }
+        var idTok = j.id_token || j.idToken;
+        var refTok = j.refresh_token || j.refreshToken;
+        var exp = j.expires_in || j.expiresIn;
+        var loc = j.user_id || j.localId || auth.localId;
+        if(!idTok) throw new Error('Your session expired. Please sign in again.');
+        applyTokenPayload(idTok, refTok, exp, auth.email, loc);
+        return auth.idToken;
+      });
+    });
+  }
+
+  function ensureIdToken(){
+    if(!isAuthed()) return Promise.reject(new Error('not-signed-in'));
+    if(auth.expiresAt && Date.now() < (auth.expiresAt - ID_TOKEN_SKEW_MS)){
+      return Promise.resolve(auth.idToken);
+    }
+    return refreshIdToken();
+  }
+
+  function authedEndpoint(token){
+    return ENDPOINT + (ENDPOINT.indexOf('?') >= 0 ? '&' : '?') + 'auth=' + encodeURIComponent(token);
+  }
+
+  function rtdbFetch(init, retried){
+    return ensureIdToken().then(function(token){
+      var req = {};
+      var k;
+      for(k in init){ if(Object.prototype.hasOwnProperty.call(init, k)) req[k] = init[k]; }
+      req.headers = req.headers || {};
+      return fetch(authedEndpoint(token), req).then(function(r){
+        return r.text().then(function(txt){
+          if(!retried && rtdbUnauth(r.status, txt)){
+            return refreshIdToken().then(function(){
+              return rtdbFetch(init, true);
+            });
+          }
+          return { status: r.status, ok: r.ok, text: txt };
+        });
+      });
+    });
+  }
+
+  function stopSync(){
+    ready = false;
+    pulling = false;
+    pendingLocal = null;
+    if(pushTimer){ try { clearTimeout(pushTimer); } catch(e){} pushTimer = null; }
+  }
+
+  function onSessionExpired(msg){
+    stopSync();
+    clearAuth();
+    setBadge('off', 'Session expired');
+    showLogin(msg || 'Your session expired. Please sign in again.');
+  }
+
+  function firebaseSignOut(){
+    stopSync();
+    clearAuth();
+    setBadge('off', 'Signed out');
+    showLogin('Signed out. Sign in to sync with the team.');
+  }
+
+  function setLoginMsg(text, isErr){
+    var el = document.getElementById('smb-stage-login-msg');
+    if(!el) return;
+    el.textContent = text || '';
+    el.style.color = isErr ? '#b42318' : '#4a5568';
+  }
+
+  function showLogin(msg){
+    var ov = document.getElementById('smb-stage-login');
+    if(!ov) mountLogin();
+    ov = document.getElementById('smb-stage-login');
+    if(ov) ov.style.display = 'flex';
+    if(msg) setLoginMsg(msg, true);
+    var out = document.querySelector('#smb-stage-badge .smb-stage-out');
+    if(out) out.style.display = 'none';
+  }
+
+  function hideLogin(){
+    var ov = document.getElementById('smb-stage-login');
+    if(ov) ov.style.display = 'none';
+    setLoginMsg('', false);
+    var out = document.querySelector('#smb-stage-badge .smb-stage-out');
+    if(out) out.style.display = '';
+  }
+
+  function mountLogin(){
+    if(document.getElementById('smb-stage-login')) return;
+    if(!document.getElementById('smb-stage-login-css')){
+      var st = document.createElement('style');
+      st.id = 'smb-stage-login-css';
+      st.textContent = '#smb-stage-login{position:fixed;inset:0;z-index:1000000;display:flex;align-items:center;justify-content:center;background:rgba(15,23,42,.72);padding:20px;}'
+        + '#smb-stage-login .smb-stage-card{width:100%;max-width:380px;background:#fff;border-radius:12px;box-shadow:0 16px 48px rgba(0,0,0,.28);padding:22px 22px 18px;font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#1a202c;}'
+        + '#smb-stage-login h2{margin:0 0 6px;font-size:18px;}'
+        + '#smb-stage-login p.smb-stage-lead{margin:0 0 16px;color:#4a5568;}'
+        + '#smb-stage-login label{display:block;margin:0 0 4px;font-weight:600;font-size:12px;color:#2d3748;}'
+        + '#smb-stage-login input{width:100%;box-sizing:border-box;margin:0 0 12px;padding:9px 10px;border:1px solid #cbd5e0;border-radius:8px;font:inherit;}'
+        + '#smb-stage-login button.smb-stage-go{width:100%;padding:10px 12px;border:0;border-radius:8px;background:#1a365d;color:#fff;font-weight:700;cursor:pointer;}'
+        + '#smb-stage-login button.smb-stage-go:disabled{opacity:.6;cursor:default;}'
+        + '#smb-stage-login #smb-stage-login-msg{min-height:1.3em;margin:10px 0 0;font-size:13px;}';
+      (document.head||document.documentElement).appendChild(st);
+    }
+    var ov = document.createElement('div');
+    ov.id = 'smb-stage-login';
+    ov.setAttribute('role', 'dialog');
+    ov.setAttribute('aria-modal', 'true');
+    ov.setAttribute('aria-labelledby', 'smb-stage-login-title');
+    ov.innerHTML = '<form class="smb-stage-card" id="smb-stage-login-form" autocomplete="on">'
+      + '<h2 id="smb-stage-login-title">Sign in</h2>'
+      + '<p class="smb-stage-lead">Enter your email and password to sync this CRM with the shared staging database.</p>'
+      + '<label for="smb-stage-email">Email</label>'
+      + '<input id="smb-stage-email" name="email" type="email" autocomplete="username" required>'
+      + '<label for="smb-stage-pass">Password</label>'
+      + '<input id="smb-stage-pass" name="password" type="password" autocomplete="current-password" required>'
+      + '<button type="submit" class="smb-stage-go" id="smb-stage-go">Sign in</button>'
+      + '<div id="smb-stage-login-msg"></div>'
+      + '</form>';
+    document.body.appendChild(ov);
+    var form = document.getElementById('smb-stage-login-form');
+    form.addEventListener('submit', function(ev){
+      ev.preventDefault();
+      if(authBusy) return;
+      var emailEl = document.getElementById('smb-stage-email');
+      var passEl = document.getElementById('smb-stage-pass');
+      var go = document.getElementById('smb-stage-go');
+      var email = emailEl ? String(emailEl.value || '').trim() : '';
+      var pass = passEl ? String(passEl.value || '') : '';
+      if(!email || !pass){
+        setLoginMsg('Enter your email and password.', true);
+        return;
+      }
+      if(!FB_WEB_API_KEY){
+        setLoginMsg('Firebase is not configured in this copy of the CRM. Paste the public Web API key into FB_WEB_API_KEY in the staging adapter (Firebase Console > Project settings > General > apiKey).', true);
+        return;
+      }
+      authBusy = true;
+      if(go) go.disabled = true;
+      setLoginMsg('Signing in...', false);
+      signInWithPassword(email, pass).then(function(){
+        authBusy = false;
+        if(go) go.disabled = false;
+        if(passEl) passEl.value = '';
+        hideLogin();
+        setBadge('sync', 'Connecting...');
+        pull();
+      }).catch(function(err){
+        authBusy = false;
+        if(go) go.disabled = false;
+        var m = (err && err.message) ? err.message : '';
+        if(!m || /failed to fetch|networkerror|load failed/i.test(m)){
+          setLoginMsg('Network failure. Check your connection and try again.', true);
+        } else {
+          setLoginMsg(m, true);
+        }
+      });
+    });
+  }
 
   function setBadge(kind, text){
     var el = document.getElementById('smb-stage-badge');
@@ -15490,6 +15803,7 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
       }
     } catch(e){}
   }
+
 
   // v2.2 MERGE-ON-PUSH. The whole leads list used to be sent as one blob,
   // last writer wins. A tab left open on an older copy would therefore
@@ -15532,31 +15846,52 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
     return { env: out, added: added };
   }
 
+  function handleRtdbAuthFailure(res){
+    if(!res) return false;
+    if(rtdbDenied(res.status, res.text)){
+      setBadge('off', 'Permission denied - tap to retry');
+      return true;
+    }
+    if(rtdbUnauth(res.status, res.text)){
+      onSessionExpired('Your session expired. Please sign in again.');
+      return true;
+    }
+    return false;
+  }
+
   function pushUp(env){
     if(typeof fetch !== 'function') return;
+    if(!isAuthed()) return;
     setBadge('sync', 'Saving...');
-    fetch(ENDPOINT, { cache: 'no-store' }).then(function(r){
-      return r.text();
-    }).then(function(txt){
+    rtdbFetch({ cache: 'no-store' }).then(function(res){
+      if(handleRtdbAuthFailure(res)) return;
+      if(!res.ok){
+        setBadge('off', 'Save failed - will retry on next save');
+        return;
+      }
       var remote = null;
-      if(txt != null && txt !== '' && txt !== 'null'){
+      if(res.text != null && res.text !== '' && res.text !== 'null'){
         try {
-          var p = JSON.parse(txt);
+          var p = JSON.parse(res.text);
           if(p && typeof p === 'object' && p.keys && typeof p.keys === 'object') remote = p;
           else throw new Error('shape');
         } catch(e){
-          // Cloud holds something we do not understand. Do NOT overwrite it.
           setBadge('off', 'Server data not recognized - not saving over it. Tap to retry');
           return;
         }
       }
       var m = mergeLeads(env, remote);
       var outEnv = m.env;
-      return fetch(ENDPOINT, {
+      return rtdbFetch({
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(outEnv)
-      }).then(function(){
+      }).then(function(saveRes){
+        if(handleRtdbAuthFailure(saveRes)) return;
+        if(!saveRes.ok){
+          setBadge('off', 'Save failed - will retry on next save');
+          return;
+        }
         lastSyncedSig = _sig(outEnv);
         pendingLocal = null;
         if(m.added > 0){
@@ -15565,7 +15900,12 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
           flash('ok', 'Saved', 1200);
         }
       });
-    }).catch(function(){
+    }).catch(function(err){
+      var m = (err && err.message) ? String(err.message) : '';
+      if(m === 'not-signed-in' || /expired|refresh token|no-refresh/i.test(m)){
+        onSessionExpired('Your session expired. Please sign in again.');
+        return;
+      }
       setBadge('off', 'Offline - will retry on next save');
     });
   }
@@ -15591,12 +15931,17 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
 
   function pull(){
     if(typeof fetch !== 'function') return;
+    if(!isAuthed()) return;
     if(pulling) return;
     pulling = true;
-    fetch(ENDPOINT, { cache: 'no-store' }).then(function(r){
-      return r.text();
-    }).then(function(txt){
+    rtdbFetch({ cache: 'no-store' }).then(function(res){
       pulling = false;
+      if(handleRtdbAuthFailure(res)) return;
+      if(!res.ok){
+        setBadge('off', 'Could not load team data - tap to retry');
+        return;
+      }
+      var txt = res.text;
 
       // CRITICAL: only treat the server as empty when it literally is.
       var serverEmpty = (txt == null || txt === '' || txt === 'null');
@@ -15655,13 +16000,20 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
       ready = true;
       flash('ok', 'Loaded team data', 1500);
       applyEnvelope(remote);
-    }).catch(function(){
+    }).catch(function(err){
       pulling = false;
+      var m = (err && err.message) ? String(err.message) : '';
+      if(m === 'not-signed-in' || m === 'missing-api-key' || m === 'no-refresh-token' ||
+         /expired|refresh token/i.test(m)){
+        onSessionExpired('Your session expired. Please sign in again.');
+        return;
+      }
       setBadge('off', 'Offline - tap to retry');
     });
   }
 
   function schedulePush(){
+    if(!isAuthed()) return;
     if(!ready) return;
     var env = collectLocal();
     if(_sig(env) === lastSyncedSig) return;
@@ -15697,6 +16049,7 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
   } catch(e){}
 
   function manualRefresh(){
+    if(!isAuthed()){ showLogin('Sign in to sync.'); return; }
     if(!ready){ pull(); return; }
     if(isEditing()){ flash('sync', 'Finish your entry, then tap', 2000); return; }
     setBadge('sync', 'Checking for updates...');
@@ -15718,25 +16071,44 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
     b.innerHTML = '<span class="smb-stage-dot" style="width:9px;height:9px;'
       + 'border-radius:50%;background:rgba(240,180,40,1);'
       + 'box-shadow:0 0 0 3px rgba(255,255,255,.12)"></span>'
-      + '<span class="smb-stage-lbl">Connecting...</span>';
+      + '<span class="smb-stage-lbl">Connecting...</span>'
+      + '<button type="button" class="smb-stage-out" style="margin-left:4px;padding:2px 8px;border:1px solid rgba(255,255,255,.28);background:transparent;color:#fff;border-radius:999px;font:600 11px/1.2 inherit;cursor:pointer;display:none;">Sign out</button>';
     if(!document.getElementById('smb-stage-badge-css')){
       var st = document.createElement('style');
       st.id = 'smb-stage-badge-css';
       st.textContent = '#smb-stage-badge{left:256px !important;right:auto !important;bottom:14px !important;}'
+        + '#smb-stage-badge .smb-stage-out:hover{border-color:#fff;}'
         + '@media (max-width:768px){#smb-stage-badge{left:14px !important;}}';
       (document.head||document.documentElement).appendChild(st);
     }
     b.addEventListener('click', manualRefresh);
+    var outBtn = b.querySelector('.smb-stage-out');
+    if(outBtn){
+      outBtn.addEventListener('click', function(e){
+        e.preventDefault();
+        e.stopPropagation();
+        firebaseSignOut();
+      });
+    }
     document.body.appendChild(b);
   }
 
   function start(){
     mountBadge();
+    mountLogin();
     try{
       document.addEventListener('keydown', function(){ lastInputTs = Date.now(); }, true);
       document.addEventListener('input',   function(){ lastInputTs = Date.now(); }, true);
     }catch(e){}
-    if(typeof fetch !== 'function'){ setBadge('off', 'Sync unsupported here'); return; }
+    if(typeof fetch !== 'function'){ setBadge('off', 'Sync unsupported here'); showLogin('Sync is not supported in this browser.'); return; }
+    restoreAuth();
+    if(!isAuthed()){
+      setBadge('off', 'Sign in required');
+      showLogin('');
+      return;
+    }
+    hideLogin();
+    setBadge('sync', 'Connecting...');
     pull();
   }
 
