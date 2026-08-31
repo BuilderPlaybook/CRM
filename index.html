@@ -629,7 +629,7 @@ summary:focus-visible,
 .av-VC{background:var(--cat-teab);color:var(--cat-tea)}
 .av-DT{background:var(--redb);color:var(--redt)}
 
-/* PRODUCTION SCHEDULE COMPACT (v26.69) - readable 16px, progressive disclosure */
+/* PRODUCTION SCHEDULE COMPACT (v26.71) - readable 16px, progressive disclosure */
 .cps-cwrap{font-size:var(--fz-data);overflow:auto;max-height:calc(100vh - 300px);border:1px solid var(--brd);border-radius:8px}
 .cps-ct{width:100%;border-collapse:collapse}
 .cps-ct thead th{position:sticky;top:0;z-index:2;background:var(--sur2);font-size:var(--fz-md);text-transform:uppercase;letter-spacing:.04em;color:var(--txm);font-weight:700;text-align:left;padding:9px 12px;border-bottom:1px solid var(--brd);white-space:nowrap}
@@ -1186,7 +1186,7 @@ summary:focus-visible,
     <div class="tb-l">
       <div class="tb-org">
         <div class="tb-org-mk" id="tb-org-mk">L</div>
-        <div><div class="tb-org-name" id="tb-org-name">&nbsp;</div><div class="tb-org-sub" id="tb-org-sub">Project Management <span class="pm-build-badge">v26.69</span></div></div>
+        <div><div class="tb-org-name" id="tb-org-name">&nbsp;</div><div class="tb-org-sub" id="tb-org-sub">Project Management <span class="pm-build-badge">v26.71</span></div></div>
       </div>
     </div>
     <div class="tb-c">
@@ -6824,7 +6824,7 @@ function publishSignals(){
    PM_STORAGE_VERSION only bumps on true data-model breaks. Load-first
    over seed; guarded for opaque-origin previews where localStorage throws.
    ════════════════════════════════════════════════════════════════════ */
-const PM_BUILD = 'v26.69';
+const PM_BUILD = 'v26.71';
 window.PM_BUILD = PM_BUILD;
 const PM_STORAGE_VERSION = 1;
 const PM_STORAGE_KEY = 'smb_pm_data_v1';
@@ -7817,8 +7817,8 @@ function _cuPhotoTiles(cu, pid){
       '</div>' +
       '<div class="cu-ph-meta">' +
       '<input class="input" value="' + escapeHtml(ph.cap || '') + '" placeholder="Caption for the client" onchange="cuPhotoSet(\'' + pid + '\',' + i + ',\'cap\',this.value)">' +
-      '<div class="cu-ph-row"><label class="cu-invite-lbl"><input type="checkbox" ' + (ph.sel ? 'checked' : '') + ' onchange="cuPhotoSet(\'' + pid + '\',' + i + ',\'sel\',this.checked)"> Include in this update</label>' +
-      '<button type="button" class="btn btn-sm btn-ghost" onclick="cuPhotoDel(\'' + pid + '\',' + i + ')">&times;</button></div>' +
+      '<div class="cu-ph-row" style="display:flex;align-items:center;justify-content:space-between;gap:8px"><label class="cu-invite-lbl"><input type="checkbox" ' + (ph.sel ? 'checked' : '') + ' onchange="cuPhotoSet(\'' + pid + '\',' + i + ',\'sel\',this.checked)"> Include</label>' +
+      '<button type="button" class="btn btn-sm btn-red" onclick="cuPhotoDel(\'' + pid + '\',' + i + ')">Remove</button></div>' +
       '</div></div>';
   }).join('') + '</div>';
 }
@@ -10813,7 +10813,8 @@ document.addEventListener('DOMContentLoaded', function(){
           sessionStorage.setItem('smb.pm.justAdopted', '1');
           try {
             if(window.D && D.activeWorkspaceId){
-              sessionStorage.setItem('smb.pm.restoreWs', JSON.stringify({ id: D.activeWorkspaceId, tab: D.activeWorkspaceTab || 'overview' }));
+              var _sub = (typeof _cuSubTab !== 'undefined') ? _cuSubTab : null;
+              sessionStorage.setItem('smb.pm.restoreWs', JSON.stringify({ id: D.activeWorkspaceId, tab: D.activeWorkspaceTab || 'overview', sub: _sub }));
             }
           } catch(e){}
           location.reload();
@@ -10938,7 +10939,12 @@ document.addEventListener('DOMContentLoaded', function(){
       if(rv){
         sessionStorage.removeItem('smb.pm.restoreWs');
         var o = JSON.parse(rv);
-        if(o && o.id && typeof openWorkspace === 'function'){ openWorkspace(o.id, o.tab); }
+        if(o && o.id && typeof openWorkspace === 'function'){
+          openWorkspace(o.id, o.tab);
+          if(o.tab === 'clientupdates' && o.sub && typeof cuSetSubTab === 'function'){
+            try { cuSetSubTab(o.id, o.sub); } catch(e){}
+          }
+        }
       }
     } catch(e){}
   }, 60);
