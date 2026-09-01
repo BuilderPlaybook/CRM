@@ -14537,17 +14537,88 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
     return ENDPOINT + (ENDPOINT.indexOf('?') >= 0 ? '&' : '?') + 'auth=' + encodeURIComponent(token);
   }
 
+  function summarizeFirebaseWriteBody(body){
+    var meta = { envelopeVersion: null, keyCount: 0, leadCount: 0 };
+    try {
+      var obj = (typeof body === 'string') ? JSON.parse(body) : body;
+      if(obj && typeof obj === 'object'){
+        if(obj.v != null) meta.envelopeVersion = obj.v;
+        if(obj.keys && typeof obj.keys === 'object' && !Array.isArray(obj.keys)){
+          meta.keyCount = Object.keys(obj.keys).length;
+          var leadStr = obj.keys['smb.crm.leads.v1'];
+          if(leadStr != null){
+            try {
+              var arr = JSON.parse(leadStr);
+              if(Array.isArray(arr)) meta.leadCount = arr.length;
+            } catch(e){}
+          }
+        }
+      }
+    } catch(e){}
+    return meta;
+  }
+
+  function logFirebaseWrite(label, meta){
+    console.log('[smb.crm.stage.debug]', {
+      ts: new Date().toISOString(),
+      label: label || 'firebase-write',
+      method: meta && meta.method ? meta.method : 'UNKNOWN',
+      path: meta && meta.path ? meta.path : FB_PATH,
+      caller: meta && meta.caller ? meta.caller : 'unknown',
+      reason: meta && meta.reason ? meta.reason : 'unknown',
+      source: meta && meta.source ? meta.source : 'unknown',
+      httpStatus: meta && meta.httpStatus != null ? meta.httpStatus : null,
+      envelopeVersion: meta && meta.envelopeVersion != null ? meta.envelopeVersion : null,
+      decodedKeyCount: meta && meta.decodedKeyCount != null ? meta.decodedKeyCount : 0,
+      leadCount: meta && meta.leadCount != null ? meta.leadCount : 0,
+      note: meta && meta.note ? meta.note : ''
+    });
+  }
+
   function rtdbFetch(init, retried){
     return ensureIdToken().then(function(token){
       var req = {};
       var k;
       for(k in init){ if(Object.prototype.hasOwnProperty.call(init, k)) req[k] = init[k]; }
       req.headers = req.headers || {};
+      var method = String(req.method || 'GET').toUpperCase();
+      if(method === 'PUT'){
+        var bodyMeta = summarizeFirebaseWriteBody(req.body);
+        var putMeta = {
+          method: method,
+          path: FB_PATH,
+          caller: 'rtdbFetch',
+          reason: 'PUT via rtdbFetch',
+          source: 'unknown',
+          httpStatus: null,
+          envelopeVersion: bodyMeta.envelopeVersion,
+          decodedKeyCount: bodyMeta.keyCount,
+          leadCount: bodyMeta.leadCount,
+          note: 'before PUT'
+        };
+        logFirebaseWrite('firebase-write-before', putMeta);
+        console.trace('[smb.crm.stage.debug] firebase PUT attempt -> crm/lida-001/data');
+      }
       return fetch(authedEndpoint(token), req).then(function(r){
         return r.text().then(function(txt){
           if(!retried && rtdbUnauth(r.status, txt)){
             return refreshIdToken().then(function(){
               return rtdbFetch(init, true);
+            });
+          }
+          if(method === 'PUT'){
+            var responseMeta = summarizeFirebaseWriteBody(txt);
+            logFirebaseWrite('firebase-write-after', {
+              method: method,
+              path: FB_PATH,
+              caller: 'rtdbFetch',
+              reason: 'PUT via rtdbFetch',
+              source: 'unknown',
+              httpStatus: r && r.status,
+              envelopeVersion: responseMeta.envelopeVersion,
+              decodedKeyCount: responseMeta.keyCount,
+              leadCount: responseMeta.leadCount,
+              note: 'after PUT '
             });
           }
           return { status: r.status, ok: r.ok, text: txt };
@@ -14691,9 +14762,12 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
     setTimeout(function(){ rest(); }, back || 1500);
   }
 
-  // Adopt a cloud envelope: write each shared key, then reload once so the
-  // module boots from the adopted data. A sessionStorage flag prevents a
-  // reload loop; personal view keys are untouched.
+  // Adopt a cloud envelope: write each shared key, then reload so the
+  // module boots from the adopted data. applyEnvelope() is only called
+  // when the remote signature differs from both lastSyncedSig and the
+  // local signature (see pull()), so after this reload the local sig will
+  // match the remote one and pull() will no longer call applyEnvelope -
+  // no sessionStorage gate needed to prevent a reload loop.
   function applyEnvelope(env){
     try {
       for(var i=0;i<KEYS.length;i++){
@@ -14704,13 +14778,7 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
         } catch(e){}
       }
     } catch(e){}
-    try {
-      if(!sessionStorage.getItem('smb.crm.stage.adopted')){
-        sessionStorage.setItem('smb.crm.stage.adopted','1');
-        location.reload();
-        return;
-      }
-    } catch(e){}
+    location.reload();
   }
 
   function handleRtdbAuthFailure(res){
@@ -14726,9 +14794,31 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
     return false;
   }
 
-  function pushUp(env){
+  function pushUp(env, reason, source){
     if(typeof fetch !== 'function') return;
     if(!isAuthed()) return;
+    var leadCountWritten = 0;
+    try {
+      var leadString = env && env.keys && Object.prototype.hasOwnProperty.call(env.keys, 'smb.crm.leads.v1') ? env.keys['smb.crm.leads.v1'] : null;
+      if(leadString != null){
+        var leadArr = JSON.parse(leadString);
+        if(Array.isArray(leadArr)) leadCountWritten = leadArr.length;
+      }
+    } catch(e){}
+    console.log('[smb.crm.stage.debug]', {
+      ts: new Date().toISOString(),
+      phase: 'pushUp',
+      caller: 'pushUp',
+      reason: reason || 'unspecified',
+      source: source || 'unknown',
+      method: 'PUT',
+      path: FB_PATH,
+      envelopeVersion: env && env.v,
+      decodedKeyCount: env && env.keys ? Object.keys(env.keys).length : 0,
+      leadCount: leadCountWritten,
+      note: 'pushUp called for write'
+    });
+    console.trace('[smb.crm.stage.debug] firebase PUT trace -> crm/lida-001/data');
     setBadge('sync', 'Saving...');
     rtdbFetch({
       method: 'PUT',
@@ -14737,9 +14827,37 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
     }).then(function(res){
       if(handleRtdbAuthFailure(res)) return;
       if(!res.ok){
+        console.log('[smb.crm.stage.debug]', {
+          ts: new Date().toISOString(),
+          phase: 'pushUp',
+          caller: 'pushUp',
+          reason: reason || 'unspecified',
+          source: source || 'unknown',
+          method: 'PUT',
+          path: FB_PATH,
+          httpStatus: res && res.status,
+          envelopeVersion: env && env.v,
+          decodedKeyCount: env && env.keys ? Object.keys(env.keys).length : 0,
+          leadCount: leadCountWritten,
+          note: 'PUT failed'
+        });
         setBadge('off', 'Save failed - will retry on next save');
         return;
       }
+      console.log('[smb.crm.stage.debug]', {
+        ts: new Date().toISOString(),
+        phase: 'pushUp',
+        caller: 'pushUp',
+        reason: reason || 'unspecified',
+        source: source || 'unknown',
+        method: 'PUT',
+        path: FB_PATH,
+        httpStatus: res && res.status,
+        envelopeVersion: env && env.v,
+        decodedKeyCount: env && env.keys ? Object.keys(env.keys).length : 0,
+        leadCount: leadCountWritten,
+        note: 'PUT succeeded'
+      });
       lastSyncedSig = _sig(env);
       if(pendingLocal && _sig(pendingLocal) === lastSyncedSig) pendingLocal = null;
       flash('ok', 'Saved', 1200);
@@ -14779,25 +14897,115 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
     pulling = true;
     rtdbFetch({ cache: 'no-store' }).then(function(res){
       pulling = false;
-      if(handleRtdbAuthFailure(res)) return;
+      var debug = function(branch, extra){
+        var safe = {
+          phase: 'pull',
+          branch: branch || 'unknown',
+          httpStatus: res && res.status,
+          httpOk: res && res.ok,
+          responseParsed: !!extra.responseParsed,
+          hasParsedKeys: !!extra.hasParsedKeys,
+          parsedV: extra.parsedV,
+          decodedV: extra.decodedV,
+          decodedKeysCount: extra.decodedKeysCount,
+          remoteLeadStringLength: extra.remoteLeadStringLength,
+          remoteLeadCount: extra.remoteLeadCount,
+          rSigEqLastSynced: !!extra.rSigEqLastSynced,
+          rSigEqLocal: !!extra.rSigEqLocal,
+          note: extra.note || ''
+        };
+        console.log('[smb.crm.stage.debug]', safe);
+      };
+      if(handleRtdbAuthFailure(res)){
+        debug('authentication/network error', {
+          responseParsed: false,
+          hasParsedKeys: false,
+          parsedV: null,
+          decodedV: null,
+          decodedKeysCount: 0,
+          remoteLeadStringLength: 0,
+          remoteLeadCount: 0,
+          rSigEqLastSynced: false,
+          rSigEqLocal: false,
+          note: 'authFailure'
+        });
+        return;
+      }
       if(!res.ok){
+        debug('authentication/network error', {
+          responseParsed: false,
+          hasParsedKeys: false,
+          parsedV: null,
+          decodedV: null,
+          decodedKeysCount: 0,
+          remoteLeadStringLength: 0,
+          remoteLeadCount: 0,
+          rSigEqLastSynced: false,
+          rSigEqLocal: false,
+          note: 'httpError'
+        });
         setBadge('off', 'Could not load team data - tap to retry');
         return;
       }
       var txt = res.text;
+      var responseNullOrEmpty = (txt == null || txt === '' || txt === 'null');
 
       // CRITICAL: only treat the server as empty when it literally is.
-      var serverEmpty = (txt == null || txt === '' || txt === 'null');
+      var serverEmpty = responseNullOrEmpty;
       var remote = null, unreadable = false;
+      var parsed = null;
+      var parsedOk = false;
+      var parsedKeys = null;
+      var remoteLeadStringLength = 0;
+      var remoteLeadCount = 0;
+      var remoteV = null;
+      var local = collectLocal();
+      var localLeadCount = 0;
+      try {
+        var localLeadString = local && local.keys && Object.prototype.hasOwnProperty.call(local.keys, 'smb.crm.leads.v1') ? local.keys['smb.crm.leads.v1'] : null;
+        if(localLeadString != null){
+          var localLeadArr = JSON.parse(localLeadString);
+          if(Array.isArray(localLeadArr)) localLeadCount = localLeadArr.length;
+        }
+      } catch(e){}
+      console.log('[smb.crm.stage.debug]', {
+        phase: 'pull',
+        branch: 'response-received',
+        httpStatus: res && res.status,
+        responseNullOrEmpty: responseNullOrEmpty,
+        parsedEnvelopeVersion: null,
+        decodedEnvelopeKeyCount: 0,
+        firebaseLeadStringLength: 0,
+        firebaseLeadCount: 0,
+        localLeadCount: localLeadCount,
+        note: 'Firebase response received'
+      });
+
       if(!serverEmpty){
         try {
-          var parsed = JSON.parse(txt);
-          if(parsed && typeof parsed === 'object' && parsed.keys && typeof parsed.keys === 'object') remote = fromWireEnvelope(parsed);
-          else unreadable = true;
+          parsed = JSON.parse(txt);
+          parsedOk = true;
+          parsedKeys = parsed && typeof parsed === 'object' && parsed.keys && typeof parsed.keys === 'object' ? parsed.keys : null;
+          if(parsed && typeof parsed === 'object' && parsed.keys && typeof parsed.keys === 'object') {
+            remote = fromWireEnvelope(parsed);
+            remoteV = remote && remote.v;
+          } else unreadable = true;
         } catch(e){ unreadable = true; }
       }
 
       if(unreadable){
+        debug('unreadable', {
+          responseParsed: parsedOk,
+          hasParsedKeys: !!(parsed && parsed.keys && typeof parsed.keys === 'object'),
+          parsedV: parsed && parsed.v,
+          decodedV: remote && remote.v,
+          decodedKeysCount: remote && remote.keys ? Object.keys(remote.keys).length : 0,
+          remoteLeadStringLength: remote && remote.keys && remote.keys['smb.crm.leads.v1'] ? String(remote.keys['smb.crm.leads.v1']).length : 0,
+          remoteLeadCount: 0,
+          rSigEqLastSynced: false,
+          rSigEqLocal: false,
+          note: 'unexpectedEnvelopeShape'
+        });
         // Server holds data in an unexpected shape. Do NOT overwrite.
         ready = false;
         setBadge('off', 'Server data not recognized - not overwriting. Tap to retry');
@@ -14813,6 +15021,18 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
           if(Number(remote.v) === 1 || Number(remote.v) === 2){
             remote = { v: ENVELOPE_V, keys: remote.keys || {} };
           } else {
+            debug('version mismatch', {
+              responseParsed: parsedOk,
+              hasParsedKeys: !!(parsed && parsed.keys && typeof parsed.keys === 'object'),
+              parsedV: parsed && parsed.v,
+              decodedV: remote && remote.v,
+              decodedKeysCount: remote && remote.keys ? Object.keys(remote.keys).length : 0,
+              remoteLeadStringLength: remote && remote.keys && remote.keys['smb.crm.leads.v1'] ? String(remote.keys['smb.crm.leads.v1']).length : 0,
+              remoteLeadCount: 0,
+              rSigEqLastSynced: false,
+              rSigEqLocal: false,
+              note: 'unknownEnvelopeVersion'
+            });
             ready = false;
             setBadge('off', 'Server envelope v' + remote.v + ' differs from app v' + ENVELOPE_V + ' - not loading/overwriting');
             return;
@@ -14820,37 +15040,179 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
         }
       }
 
-      var local = collectLocal();
-
       if(serverEmpty){
-        // Genuinely empty: seed the shared node from this browser.
-        pushUp(local);
-        ready = true;
+        console.log('[smb.crm.stage.debug]', {
+          phase: 'pull',
+          branch: 'serverEmpty',
+          httpStatus: res && res.status,
+          responseNullOrEmpty: true,
+          parsedEnvelopeVersion: parsed && parsed.v,
+          decodedEnvelopeKeyCount: remote && remote.keys ? Object.keys(remote.keys).length : 0,
+          firebaseLeadStringLength: 0,
+          firebaseLeadCount: 0,
+          localLeadCount: localLeadCount,
+          note: 'REFUSED AUTO-PUSH: Firebase is empty; do not overwrite with local demo state without explicit bootstrap'
+        });
+        // Safety: never auto-seed a shared staging node from a browser-local demo state.
+        // An intentional bootstrap must use the explicit seed script or an operator action,
+        // not the startup pull path.
+        ready = false;
+        setBadge('off', 'Firebase is empty - explicit seed required');
         return;
       }
 
+      console.log('[smb.crm.stage.debug]', {
+        phase: 'pull',
+        branch: 'not-serverEmpty',
+        httpStatus: res && res.status,
+        responseNullOrEmpty: false,
+        parsedEnvelopeVersion: remote && remote.v,
+        decodedEnvelopeKeyCount: remote && remote.keys ? Object.keys(remote.keys).length : 0,
+        firebaseLeadStringLength: remote && remote.keys && remote.keys['smb.crm.leads.v1'] ? String(remote.keys['smb.crm.leads.v1']).length : 0,
+        firebaseLeadCount: remoteLeadCount,
+        localLeadCount: localLeadCount,
+        note: 'NO STARTUP PUSH'
+      });
+
       if(pendingLocal !== null){
-        if(!pushTimer){ pushUp(pendingLocal); }
+        debug('applyEnvelope', {
+          responseParsed: parsedOk,
+          hasParsedKeys: !!(parsed && parsed.keys && typeof parsed.keys === 'object'),
+          parsedV: parsed && parsed.v,
+          decodedV: remote && remote.v,
+          decodedKeysCount: remote && remote.keys ? Object.keys(remote.keys).length : 0,
+          remoteLeadStringLength: remote && remote.keys && remote.keys['smb.crm.leads.v1'] ? String(remote.keys['smb.crm.leads.v1']).length : 0,
+          remoteLeadCount: 0,
+          rSigEqLastSynced: false,
+          rSigEqLocal: false,
+          note: 'pendingLocalWins'
+        });
+        if(!pushTimer){ pushUp(pendingLocal, 'pendingLocalWins', 'background'); }
         ready = true; rest();
         return;
       }
       var rSig = _sig(remote);
-      if(rSig === lastSyncedSig){ ready = true; flash('ok', 'Up to date', 1200); return; }
-      if(rSig === _sig(local)){ lastSyncedSig = rSig; ready = true; flash('ok', 'Up to date', 1200); return; }
+      var localSig = _sig(local);
+      var rSigMatchesLast = (rSig === lastSyncedSig);
+      var rSigMatchesLocal = (rSig === localSig);
+
+      if(rSigMatchesLast){
+        debug('lastSyncedSig match', {
+          responseParsed: parsedOk,
+          hasParsedKeys: !!(parsed && parsed.keys && typeof parsed.keys === 'object'),
+          parsedV: parsed && parsed.v,
+          decodedV: remote && remote.v,
+          decodedKeysCount: remote && remote.keys ? Object.keys(remote.keys).length : 0,
+          remoteLeadStringLength: remote && remote.keys && remote.keys['smb.crm.leads.v1'] ? String(remote.keys['smb.crm.leads.v1']).length : 0,
+          remoteLeadCount: 0,
+          rSigEqLastSynced: true,
+          rSigEqLocal: false,
+          note: 'remoteMatchesLastSyncedSig'
+        });
+        ready = true; flash('ok', 'Up to date', 1200); return;
+      }
+      if(rSigMatchesLocal){
+        lastSyncedSig = rSig;
+        debug('local signature match', {
+          responseParsed: parsedOk,
+          hasParsedKeys: !!(parsed && parsed.keys && typeof parsed.keys === 'object'),
+          parsedV: parsed && parsed.v,
+          decodedV: remote && remote.v,
+          decodedKeysCount: remote && remote.keys ? Object.keys(remote.keys).length : 0,
+          remoteLeadStringLength: remote && remote.keys && remote.keys['smb.crm.leads.v1'] ? String(remote.keys['smb.crm.leads.v1']).length : 0,
+          remoteLeadCount: 0,
+          rSigEqLastSynced: false,
+          rSigEqLocal: true,
+          note: 'remoteMatchesLocalSig'
+        });
+        ready = true; flash('ok', 'Up to date', 1200); return;
+      }
 
       // Cloud has data this browser does not. Adopt it.
+      var remoteLeadString = remote && remote.keys && Object.prototype.hasOwnProperty.call(remote.keys, 'smb.crm.leads.v1') ? remote.keys['smb.crm.leads.v1'] : null;
+      var remoteLeadCount = 0;
+      try {
+        if(remoteLeadString != null){
+          var leadArr = JSON.parse(remoteLeadString);
+          if(Array.isArray(leadArr)) remoteLeadCount = leadArr.length;
+        }
+      } catch(e){}
+      console.log('[smb.crm.stage.debug]', {
+        phase: 'pull',
+        branch: 'applyEnvelope',
+        httpStatus: res && res.status,
+        httpOk: res && res.ok,
+        responseParsed: parsedOk,
+        hasParsedKeys: !!(parsed && parsed.keys && typeof parsed.keys === 'object'),
+        parsedV: parsed && parsed.v,
+        decodedV: remote && remote.v,
+        decodedKeysCount: remote && remote.keys ? Object.keys(remote.keys).length : 0,
+        remoteLeadStringLength: remoteLeadString ? String(remoteLeadString).length : 0,
+        remoteLeadCount: remoteLeadCount,
+        rSigEqLastSynced: rSigMatchesLast,
+        rSigEqLocal: rSigMatchesLocal,
+        note: 'aboutToApplyEnvelope'
+      });
       lastSyncedSig = rSig;
       ready = true;
       flash('ok', 'Loaded team data', 1500);
       applyEnvelope(remote);
+      console.log('[smb.crm.stage.debug]', {
+        phase: 'pull',
+        branch: 'applyEnvelope-called',
+        httpStatus: res && res.status,
+        httpOk: res && res.ok,
+        responseParsed: parsedOk,
+        hasParsedKeys: !!(parsed && parsed.keys && typeof parsed.keys === 'object'),
+        parsedV: parsed && parsed.v,
+        decodedV: remote && remote.v,
+        decodedKeysCount: remote && remote.keys ? Object.keys(remote.keys).length : 0,
+        remoteLeadStringLength: remoteLeadString ? String(remoteLeadString).length : 0,
+        remoteLeadCount: remoteLeadCount,
+        rSigEqLastSynced: rSigMatchesLast,
+        rSigEqLocal: rSigMatchesLocal,
+        note: 'applyEnvelopeInvoked'
+      });
     }).catch(function(err){
       pulling = false;
       var m = (err && err.message) ? String(err.message) : '';
       if(m === 'not-signed-in' || m === 'missing-api-key' || m === 'no-refresh-token' ||
          /expired|refresh token/i.test(m)){
+        console.log('[smb.crm.stage.debug]', {
+          phase: 'pull',
+          branch: 'authentication/network error',
+          httpStatus: null,
+          httpOk: false,
+          responseParsed: false,
+          hasParsedKeys: false,
+          parsedV: null,
+          decodedV: null,
+          decodedKeysCount: 0,
+          remoteLeadStringLength: 0,
+          remoteLeadCount: 0,
+          rSigEqLastSynced: false,
+          rSigEqLocal: false,
+          note: 'catchAuthError'
+        });
         onSessionExpired('Your session expired. Please sign in again.');
         return;
       }
+      console.log('[smb.crm.stage.debug]', {
+        phase: 'pull',
+        branch: 'authentication/network error',
+        httpStatus: null,
+        httpOk: false,
+        responseParsed: false,
+        hasParsedKeys: false,
+        parsedV: null,
+        decodedV: null,
+        decodedKeysCount: 0,
+        remoteLeadStringLength: 0,
+        remoteLeadCount: 0,
+        rSigEqLastSynced: false,
+        rSigEqLocal: false,
+        note: 'catchNetworkError'
+      });
       setBadge('off', 'Offline - tap to retry');
     });
   }
@@ -14862,7 +15224,7 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
     if(_sig(env) === lastSyncedSig) return;
     pendingLocal = env;
     if(pushTimer) clearTimeout(pushTimer);
-    pushTimer = setTimeout(function(){ pushTimer = null; if(pendingLocal) pushUp(pendingLocal); }, 800);
+    pushTimer = setTimeout(function(){ pushTimer = null; if(pendingLocal) pushUp(pendingLocal, 'scheduledLocalSave', 'user'); }, 800);
   }
 
   // Save intercepts, three layers (all sig-guarded so extras are free):
@@ -14896,7 +15258,6 @@ else document.addEventListener('DOMContentLoaded',function(){bdAttachDebouncedSe
     if(!ready){ pull(); return; }
     if(isEditing()){ flash('sync', 'Finish your entry, then tap', 2000); return; }
     setBadge('sync', 'Checking for updates...');
-    try { sessionStorage.removeItem('smb.crm.stage.adopted'); } catch(e){}
     pull();
   }
 
